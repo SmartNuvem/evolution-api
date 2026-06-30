@@ -168,6 +168,11 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
   isViewOnce?: boolean;
 }
 
+type RuntimeCleanupResult = {
+  socketClosed: boolean;
+  reconnectTimerCleared: boolean;
+};
+
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
 // Adicione a função getVideoDuration no início do arquivo
@@ -263,6 +268,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private isDeleting = false; // Flag to prevent reconnection during deletion
   private reconnectTimer?: NodeJS.Timeout;
+  private suppressReconnectUntil = 0;
   private lastStream515At = 0;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
@@ -285,6 +291,194 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  private clearReconnectTimer(): boolean {
+    if (!this.reconnectTimer) {
+      return false;
+    }
+
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+
+    return true;
+  }
+
+  private closeCurrentSocket(reason: string): boolean {
+    if (!this.client) {
+      return false;
+    }
+
+    try {
+      this.client.ws?.close();
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to close Baileys websocket',
+        instanceName: this.instance.name,
+        instanceId: this.instanceId,
+        reason,
+        error,
+      });
+    }
+
+    try {
+      this.client.end(new Error(reason));
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to end Baileys client',
+        instanceName: this.instance.name,
+        instanceId: this.instanceId,
+        reason,
+        error,
+      });
+    }
+
+    return true;
+  }
+
+  private async cleanupRuntimeState(reason: string): Promise<RuntimeCleanupResult> {
+    const reconnectTimerCleared = this.clearReconnectTimer();
+    this.suppressReconnectUntil = Date.now() + 5000;
+
+    this.messageProcessor.onDestroy();
+    const socketClosed = this.closeCurrentSocket(reason);
+
+    this.instance.qrcode = { count: 0 };
+    this.stateConnection = { state: 'close', statusReason: 200 };
+
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: { connectionStatus: 'close' },
+    });
+
+    return { socketClosed, reconnectTimerCleared };
+  }
+
+  private async removeStoredAuthState() {
+    const db = this.configService.get<Database>('DATABASE');
+    const cache = this.configService.get<CacheConf>('CACHE');
+    const provider = this.configService.get<ProviderSession>('PROVIDER');
+
+    if (provider?.ENABLED) {
+      const authState = await this.authStateProvider.authStateProvider(this.instance.id);
+
+      await authState.removeCreds();
+    }
+
+    if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
+      const authState = await useMultiFileAuthStateRedisDb(this.instance.id, this.cache);
+
+      await authState.removeCreds();
+    }
+
+    if (db.SAVE_DATA.INSTANCE) {
+      const authState = await useMultiFileAuthStatePrisma(this.instance.id, this.cache);
+
+      await authState.removeCreds();
+    }
+
+    const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
+    if (sessionExists) {
+      await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
+    }
+  }
+
+  public async restart(): Promise<WASocket> {
+    const statusBefore = this.connectionStatus?.state;
+    const authStatePreserved = true;
+    const cleanup = await this.cleanupRuntimeState('Instance restart');
+
+    this.logger.info({
+      message: 'Restarting Baileys instance with preserved auth state',
+      instanceName: this.instance.name,
+      instanceId: this.instanceId,
+      statusBefore,
+      statusAfterCleanup: this.connectionStatus?.state,
+      socketClosed: cleanup.socketClosed,
+      reconnectTimerCleared: cleanup.reconnectTimerCleared,
+      authStatePreserved,
+      qrReset: true,
+    });
+
+    try {
+      const client = await this.connectToWhatsapp(this.phoneNumber);
+
+      this.logger.info({
+        message: 'Baileys restart reconnect started',
+        instanceName: this.instance.name,
+        instanceId: this.instanceId,
+        statusBefore,
+        statusAfter: this.connectionStatus?.state,
+        authStatePreserved,
+        generatedQr: !!this.instance.qrcode?.code,
+      });
+
+      return client;
+    } catch (error) {
+      this.logger.error({
+        message: 'Baileys restart failed',
+        instanceName: this.instance.name,
+        instanceId: this.instanceId,
+        statusBefore,
+        statusAfter: this.connectionStatus?.state,
+        authStatePreserved,
+        error,
+      });
+
+      throw error;
+    }
+  }
+
+  public async reset(): Promise<WASocket> {
+    const statusBefore = this.connectionStatus?.state;
+    const cleanup = await this.cleanupRuntimeState('Instance reset');
+
+    await this.removeStoredAuthState();
+
+    this.instance.authState = undefined;
+    this.instance.wuid = undefined;
+    this.instance.profileName = undefined;
+    this.instance.profilePictureUrl = undefined;
+
+    this.logger.info({
+      message: 'Resetting Baileys instance auth state',
+      instanceName: this.instance.name,
+      instanceId: this.instanceId,
+      statusBefore,
+      statusAfterCleanup: this.connectionStatus?.state,
+      socketClosed: cleanup.socketClosed,
+      reconnectTimerCleared: cleanup.reconnectTimerCleared,
+      authStatePreserved: false,
+      chatwootPreserved: this.localChatwoot?.enabled === true,
+    });
+
+    try {
+      const client = await this.connectToWhatsapp(this.phoneNumber);
+
+      this.logger.info({
+        message: 'Baileys reset QR reconnect started',
+        instanceName: this.instance.name,
+        instanceId: this.instanceId,
+        statusBefore,
+        statusAfter: this.connectionStatus?.state,
+        authStatePreserved: false,
+        generatedQr: !!this.instance.qrcode?.code,
+      });
+
+      return client;
+    } catch (error) {
+      this.logger.error({
+        message: 'Baileys reset failed',
+        instanceName: this.instance.name,
+        instanceId: this.instanceId,
+        statusBefore,
+        statusAfter: this.connectionStatus?.state,
+        authStatePreserved: false,
+        error,
+      });
+
+      throw error;
+    }
   }
 
   public async logoutInstance() {
@@ -319,32 +513,7 @@ export class BaileysStartupService extends ChannelStartupService {
     // is delayed.
     this.stateConnection = { state: 'close', statusReason: 401 };
 
-    const db = this.configService.get<Database>('DATABASE');
-    const cache = this.configService.get<CacheConf>('CACHE');
-    const provider = this.configService.get<ProviderSession>('PROVIDER');
-
-    if (provider?.ENABLED) {
-      const authState = await this.authStateProvider.authStateProvider(this.instance.id);
-
-      await authState.removeCreds();
-    }
-
-    if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
-      const authState = await useMultiFileAuthStateRedisDb(this.instance.id, this.cache);
-
-      await authState.removeCreds();
-    }
-
-    if (db.SAVE_DATA.INSTANCE) {
-      const authState = await useMultiFileAuthStatePrisma(this.instance.id, this.cache);
-
-      await authState.removeCreds();
-    }
-
-    const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
-    if (sessionExists) {
-      await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
-    }
+    await this.removeStoredAuthState();
 
     await this.prismaRepository.instance.update({
       where: { id: this.instanceId },
@@ -503,8 +672,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       // Check if instance is being deleted or session is ending
-      if (this.isDeleting || this.endSession) {
-        this.logger.info('Instance is being deleted/ended, skipping reconnection attempt');
+      if (this.isDeleting || this.endSession || Date.now() < this.suppressReconnectUntil) {
+        this.logger.info({
+          message: 'Instance is being deleted/ended or manually restarting, skipping reconnection attempt',
+          instanceName: this.instance.name,
+          instanceId: this.instanceId,
+          isDeleting: this.isDeleting,
+          endSession: this.endSession,
+          suppressReconnectUntil: this.suppressReconnectUntil,
+        });
         return;
       }
 

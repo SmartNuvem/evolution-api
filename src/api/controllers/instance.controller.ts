@@ -358,20 +358,35 @@ export class InstanceController {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
       }
 
-      if (state === 'close') {
-        throw new BadRequestException('The "' + instanceName + '" instance is not connected');
-      }
-      this.logger.info(`Restarting instance: ${instanceName}`);
+      this.logger.info({
+        message: 'Restart requested',
+        instanceName,
+        statusBefore: state,
+        hasSocket: !!instance.client,
+        hasRestartMethod: typeof instance.restart === 'function',
+      });
 
       if (typeof instance.restart === 'function') {
         await instance.restart();
         // Wait a bit for the reconnection to be established
         await new Promise((r) => setTimeout(r, 2000));
+
+        const statusAfter = instance.connectionStatus?.state || 'connecting';
+        this.logger.info({
+          message: 'Restart finished',
+          instanceName,
+          statusBefore: state,
+          statusAfter,
+          authStatePreserved: true,
+          generatedQr: !!instance.qrCode?.code,
+        });
+
         return {
           instance: {
             instanceName: instanceName,
-            status: instance.connectionStatus?.state || 'connecting',
+            status: statusAfter,
           },
+          qrcode: instance.qrCode,
         };
       }
 
@@ -384,14 +399,69 @@ export class InstanceController {
         return await this.connectToWhatsapp({ instanceName });
       }
 
-      return {
-        instance: {
-          instanceName: instanceName,
-          status: state,
-        },
-      };
+      return await this.connectToWhatsapp({ instanceName });
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error({
+        message: 'Restart failed',
+        instanceName,
+        error,
+      });
+      return { error: true, message: error.toString() };
+    }
+  }
+
+  public async resetInstance({ instanceName }: InstanceDto) {
+    try {
+      const instance = this.waMonitor.waInstances[instanceName];
+      const state = instance?.connectionStatus?.state;
+
+      if (!state) {
+        throw new BadRequestException('The "' + instanceName + '" instance does not exist');
+      }
+
+      this.logger.info({
+        message: 'Reset requested',
+        instanceName,
+        statusBefore: state,
+        hasSocket: !!instance.client,
+        hasResetMethod: typeof instance.reset === 'function',
+      });
+
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
+
+      if (typeof instance.reset === 'function') {
+        await instance.reset();
+        await new Promise((r) => setTimeout(r, 2000));
+
+        const statusAfter = instance.connectionStatus?.state || 'connecting';
+        this.logger.info({
+          message: 'Reset finished',
+          instanceName,
+          statusBefore: state,
+          statusAfter,
+          authStatePreserved: false,
+          chatwootPreserved: !!instance.localChatwoot?.enabled,
+          generatedQr: !!instance.qrCode?.code,
+        });
+
+        return {
+          instance: {
+            instanceName,
+            status: statusAfter,
+          },
+          qrcode: instance.qrCode,
+        };
+      }
+
+      await this.logout({ instanceName });
+
+      return await this.connectToWhatsapp({ instanceName });
+    } catch (error) {
+      this.logger.error({
+        message: 'Reset failed',
+        instanceName,
+        error,
+      });
       return { error: true, message: error.toString() };
     }
   }
@@ -449,7 +519,21 @@ export class InstanceController {
     }
 
     try {
-      await this.waMonitor.waInstances[instanceName]?.logoutInstance();
+      const waInstance = this.waMonitor.waInstances[instanceName];
+
+      this.logger.info({
+        message: 'Logout/reset requested',
+        instanceName,
+        statusBefore: instance.state,
+        hasResetMethod: typeof waInstance?.reset === 'function',
+        chatwootPreserved: !!waInstance?.localChatwoot?.enabled,
+      });
+
+      if (typeof waInstance?.reset === 'function' && instance.state === 'connecting') {
+        await waInstance.reset();
+      } else {
+        await waInstance?.logoutInstance();
+      }
 
       return { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } };
     } catch (error) {
